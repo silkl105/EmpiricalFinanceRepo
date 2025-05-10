@@ -11,3 +11,4 @@ dependencies:
   - seaborn
   - statsmodels
   - xlsxwriter
+  - scikit-learn

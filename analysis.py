@@ -436,7 +436,9 @@ class TechnicalTradingCase:
         table :
             Multi-index (metric x subperiod) DataFrame.
         """
-        ls = self.long_short_returns[formation]
+        ls = (self.long_short_returns_factor 
+              if self.use_excess 
+              else self.long_short_returns)[formation]
         groups = {"Full sample": slice(None)}
         # build 10‑year non‑overlapping windows
         years = sorted({d.year for d in ls.index})

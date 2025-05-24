@@ -73,6 +73,11 @@ class TechnicalTradingCase:
     Implements the complete momentum-strategy analysis up to (and including)
     task #7 of the case study.
 
+    Notes
+    -----
+    All strategies use raw returns (not excess returns), i.e., without subtracting the risk-free rate,
+    since long-short portfolios already net out the risk-free component.
+
     Parameters
     ----------
     root_dir :
@@ -80,15 +85,23 @@ class TechnicalTradingCase:
         are stored.
     """
     root_dir: pathlib.Path | str = "."
-    use_excess: bool = True
 
     # --------------------------------------------------------------------- #
-    def numeric_rank_strategy(self, q: float = 0.10) -> tuple[pd.Series, sm.RegressionResults]:
+    def numeric_rank_strategy(self, q: float = 0.10) -> tuple[pd.Series, sm.RegressionResults, float]:
         """
         In-sample long-short using numeric decile ranks instead of 30 dummies.
         Collapses each signal's decile into a numeric 1–10 variable,
         fits cross-sectional OLS on these three ranks (no intercept),
         and constructs a q/1-q long-short portfolio.
+
+        Returns
+        -------
+        returns :
+            Series of long-short returns per month.
+        result :
+            Fitted OLS RegressionResults.
+        turnover :
+            Average annual turnover percentage of the strategy.
         """
         df_next = self.industries.shift(-1)
         y = df_next.stack(future_stack=True)
@@ -105,26 +118,34 @@ class TechnicalTradingCase:
         preds = X.dot(result.params).unstack()
 
         ls = []
+        positions = []
         for t, row in preds.iterrows():
             rnk = row.rank(method="first")
             n = rnk.count()
+            weight = pd.Series(0.0, index=row.index)
             if n == 0:
                 ls.append(np.nan)
+                positions.append(weight)
                 continue
-            long = row[rnk > n * (1 - q)]
-            short = row[rnk <= n * q]
+            long_idx = rnk > n * (1 - q)
+            short_idx = rnk <= n * q
+            if long_idx.any() and short_idx.any():
+                weight.loc[row.index[long_idx]] = 1.0 / long_idx.sum()
+                weight.loc[row.index[short_idx]] = -1.0 / short_idx.sum()
             ret_row = df_next.loc[t]
-            if long.empty or short.empty:
+            if not long_idx.any() or not short_idx.any():
                 ls.append(np.nan)
             else:
-                ls.append(ret_row[long.index].mean() - ret_row[short.index].mean())
-
+                ls.append(ret_row[long_idx].mean() - ret_row[short_idx].mean())
+            positions.append(weight)
         returns = pd.Series(ls, index=preds.index, name="RankedStrategy")
-        return returns, result
+        positions_df = pd.DataFrame(positions, index=preds.index)
+        turnover = self._compute_average_yearly_turnover(positions_df)
+        return returns, result, turnover
 
     def regression_tree_strategy(
         self, q: float = 0.10, n_iter: int = 50
-    ) -> tuple[pd.Series, RandomizedSearchCV]:
+    ) -> tuple[pd.Series, RandomizedSearchCV, float]:
         """
         In-sample long-short returns using a regression tree on numeric rank features.
         Hyperparameter tuning via RandomizedSearchCV with n_iter iterations.
@@ -132,9 +153,11 @@ class TechnicalTradingCase:
         Returns
         -------
         returns :
-            Series of long-short excess returns per month.
+            Series of long-short returns per month.
         search :
             Fitted RandomizedSearchCV object (best_estimator_, best_score_).
+        turnover :
+            Average annual turnover percentage of the strategy.
         """
         # Next-month returns
         df_next = self.industries.shift(-1)
@@ -178,28 +201,36 @@ class TechnicalTradingCase:
             preds.append(model.predict(df_feat))
         exp_ret = pd.DataFrame(preds, index=df_next.index, columns=df_next.columns)
 
-        # Build long-short portfolio returns
+        # Build long-short portfolio returns and positions for turnover
         ls = []
+        positions = []
         for t, row in exp_ret.iterrows():
             rnk = row.rank(method="first")
             n = rnk.count()
+            weight = pd.Series(0.0, index=row.index)
             if n == 0:
                 ls.append(np.nan)
+                positions.append(weight)
                 continue
             long_idx = rnk > n * (1 - q)
             short_idx = rnk <= n * q
+            if long_idx.any() and short_idx.any():
+                weight.loc[row.index[long_idx]] = 1.0 / long_idx.sum()
+                weight.loc[row.index[short_idx]] = -1.0 / short_idx.sum()
             ret_row = df_next.loc[t]
             if not long_idx.any() or not short_idx.any():
                 ls.append(np.nan)
             else:
                 ls.append(ret_row[long_idx].mean() - ret_row[short_idx].mean())
-
+            positions.append(weight)
         returns = pd.Series(ls, index=exp_ret.index, name="TreeStrategy")
-        return returns, search
+        positions_df = pd.DataFrame(positions, index=exp_ret.index)
+        turnover = self._compute_average_yearly_turnover(positions_df)
+        return returns, search, turnover
 
     def oos_dummy_strategy(
         self, train_window: int = 36, q: float = 0.10, start_year: int = 2001
-    ) -> tuple[pd.Series, float]:
+    ) -> tuple[pd.Series, float, float]:
         """
         Out-of-sample long-short using 30 dummy regression with a rolling window.
 
@@ -215,12 +246,14 @@ class TechnicalTradingCase:
         Returns
         -------
         ls_returns :
-            Series of OOS long-short excess returns.
+            Series of OOS long-short returns.
         oos_r2 :
             R² of stacked OOS predictions vs. actual returns.
+        turnover :
+            Average annual turnover percentage of the strategy.
         """
-        dates = self.industries.index
-        df_next = self.industries.shift(-1)
+        dates = self.industries_full.index
+        df_next = self.industries_full.shift(-1)
 
         oos_positions = [
             i for i, d in enumerate(dates)
@@ -228,6 +261,7 @@ class TechnicalTradingCase:
         ]
         ls_list = []
         y_true, y_pred = [], []
+        positions = []
 
         for i in oos_positions:
             t = dates[i]
@@ -269,11 +303,17 @@ class TechnicalTradingCase:
             shorts = exp_ret[rnk <= n * q].index
             ret_row = df_next.loc[t]
             ls = np.nan
+            w = pd.Series(0.0, index=df_next.columns)
             if longs.size and shorts.size:
                 ls = ret_row[longs].mean() - ret_row[shorts].mean()
+                w.loc[longs] = 1.0 / len(longs)
+                w.loc[shorts] = -1.0 / len(shorts)
+            positions.append(w)
             ls_list.append(ls)
 
         ls_series = pd.Series(ls_list, index=dates[oos_positions], name="DummyOOS")
+        positions_df = pd.DataFrame(positions, index=dates[oos_positions])
+        turnover = self._compute_average_yearly_turnover(positions_df)
         # Compute OOS R², dropping NaNs
         y_arr = np.array(y_true, dtype=float)
         pred_arr = np.array(y_pred, dtype=float)
@@ -282,13 +322,22 @@ class TechnicalTradingCase:
             oos_r2 = r2_score(y_arr[valid], pred_arr[valid])
         else:
             oos_r2 = np.nan
-        return ls_series, oos_r2
+        return ls_series, oos_r2, turnover
 
     def oos_numeric_rank_strategy(
         self, train_window: int = 36, q: float = 0.10, start_year: int = 2001
-    ) -> tuple[pd.Series, float]:
+    ) -> tuple[pd.Series, float, float]:
         """
         Out-of-sample long-short using numeric rank regression with a rolling window.
+
+        Returns
+        -------
+        ls_returns :
+            Series of OOS long-short returns.
+        oos_r2 :
+            R² of stacked OOS predictions vs. actual returns.
+        turnover :
+            Average annual turnover percentage of the strategy.
         """
         dates = self.industries.index
         df_next = self.industries.shift(-1)
@@ -299,6 +348,7 @@ class TechnicalTradingCase:
         ]
         ls_list = []
         y_true, y_pred = [], []
+        positions = []
 
         for i in oos_positions:
             t = dates[i]
@@ -328,11 +378,17 @@ class TechnicalTradingCase:
             shorts = exp_ret[rnk <= n * q].index
             ret_row = df_next.loc[t]
             ls = np.nan
+            w = pd.Series(0.0, index=df_next.columns)
             if longs.size and shorts.size:
                 ls = ret_row[longs].mean() - ret_row[shorts].mean()
+                w.loc[longs] = 1.0 / len(longs)
+                w.loc[shorts] = -1.0 / len(shorts)
+            positions.append(w)
             ls_list.append(ls)
 
         ls_series = pd.Series(ls_list, index=dates[oos_positions], name="RankedOOS")
+        positions_df = pd.DataFrame(positions, index=dates[oos_positions])
+        turnover = self._compute_average_yearly_turnover(positions_df)
         # Compute OOS R², dropping NaNs
         y_arr = np.array(y_true, dtype=float)
         pred_arr = np.array(y_pred, dtype=float)
@@ -341,13 +397,22 @@ class TechnicalTradingCase:
             oos_r2 = r2_score(y_arr[valid], pred_arr[valid])
         else:
             oos_r2 = np.nan
-        return ls_series, oos_r2
+        return ls_series, oos_r2, turnover
 
     def oos_regression_tree_strategy(
         self, train_window: int = 36, q: float = 0.10, start_year: int = 2001
-    ) -> tuple[pd.Series, float]:
+    ) -> tuple[pd.Series, float, float]:
         """
         Out-of-sample long-short using regression-tree with a rolling window.
+
+        Returns
+        -------
+        ls_returns :
+            Series of OOS long-short returns.
+        oos_r2 :
+            R² of stacked OOS predictions vs. actual returns.
+        turnover :
+            Average annual turnover percentage of the strategy.
         """
         dates = self.industries.index
         df_next = self.industries.shift(-1)
@@ -358,6 +423,7 @@ class TechnicalTradingCase:
         ]
         ls_list = []
         y_true, y_pred = [], []
+        positions = []
 
         for i in oos_positions:
             t = dates[i]
@@ -396,11 +462,17 @@ class TechnicalTradingCase:
             shorts = exp_ret[rnk <= n * q].index
             ret_row = df_next.loc[t]
             ls = np.nan
+            w = pd.Series(0.0, index=df_next.columns)
             if longs.size and shorts.size:
                 ls = ret_row[longs].mean() - ret_row[shorts].mean()
+                w.loc[longs] = 1.0 / len(longs)
+                w.loc[shorts] = -1.0 / len(shorts)
+            positions.append(w)
             ls_list.append(ls)
 
         ls_series = pd.Series(ls_list, index=dates[oos_positions], name="TreeOOS")
+        positions_df = pd.DataFrame(positions, index=dates[oos_positions])
+        turnover = self._compute_average_yearly_turnover(positions_df)
         # Compute OOS R², dropping NaNs
         y_arr = np.array(y_true, dtype=float)
         pred_arr = np.array(y_pred, dtype=float)
@@ -409,7 +481,7 @@ class TechnicalTradingCase:
             oos_r2 = r2_score(y_arr[valid], pred_arr[valid])
         else:
             oos_r2 = np.nan
-        return ls_series, oos_r2
+        return ls_series, oos_r2, turnover
     # Public API                                                            #
     # --------------------------------------------------------------------- #
     def __post_init__(self) -> None:
@@ -425,6 +497,8 @@ class TechnicalTradingCase:
         Compute mean, std, and Sharpe ratio of the long-short strategy for the
         full sample and consecutive non-overlapping 10-year windows.
 
+        Uses raw long-short returns for Sharpe calculations (no risk-free subtraction).
+
         Parameters
         ----------
         formation :
@@ -436,9 +510,7 @@ class TechnicalTradingCase:
         table :
             Multi-index (metric x subperiod) DataFrame.
         """
-        ls = (self.long_short_returns_factor 
-              if self.use_excess 
-              else self.long_short_returns)[formation]
+        ls = self.long_short_returns[formation]
         groups = {"Full sample": slice(None)}
         # build 10‑year non‑overlapping windows
         years = sorted({d.year for d in ls.index})
@@ -614,7 +686,7 @@ class TechnicalTradingCase:
     # ------------------------- #
     # Task 7 — refined strategy #
     # ------------------------- #
-    def refined_strategy_returns(self, q: float = 0.10) -> pd.Series:
+    def refined_strategy_returns(self, q: float = 0.10) -> tuple[pd.Series, float]:
         """
         Build long-short returns using the expected-return forecasts from the
         full 30-dummy regression.
@@ -626,7 +698,10 @@ class TechnicalTradingCase:
 
         Returns
         -------
-        Series of long-short excess returns per month.
+        returns :
+            Series of long-short returns per month.
+        turnover :
+            Average annual turnover percentage of the strategy.
         """
         res = self.multivariate_dummy_regression()
         # actual next-month returns for alignment
@@ -646,25 +721,31 @@ class TechnicalTradingCase:
 
         exp_ret = sum(preds).unstack()  # T × N
 
-        # Each month: rank expected return, go long top q%, short bottom q%
-        ls = []
+        # Build long-short returns and positions for turnover
+        ls_list = []
+        positions = []
         for t, row in exp_ret.iterrows():
             rnk = row.rank(method="first")
             n = rnk.count()
-            if n == 0:
-                ls.append(np.nan)
-                continue
-            long = row[rnk > n * (1 - q)]
-            short = row[rnk <= n * q]
-            if long.empty or short.empty:
-                ls.append(np.nan)
-                continue
-            # retrieve next-month actual returns
-            ret_row = df_next.loc[t]
-            ls_ret = ret_row[long.index].mean() - ret_row[short.index].mean()
-            ls.append(ls_ret)
-
-        return pd.Series(ls, index=exp_ret.index, name="RefinedLS")
+            weight = pd.Series(0.0, index=row.index)
+            if n > 0:
+                long_idx = rnk > n * (1 - q)
+                short_idx = rnk <= n * q
+                if long_idx.any() and short_idx.any():
+                    weight.loc[row.index[long_idx]] = 1.0 / long_idx.sum()
+                    weight.loc[row.index[short_idx]] = -1.0 / short_idx.sum()
+                    ret_row = df_next.loc[t]
+                    ls_list.append(ret_row[long_idx].mean() -
+                                   ret_row[short_idx].mean())
+                else:
+                    ls_list.append(np.nan)
+            else:
+                ls_list.append(np.nan)
+            positions.append(weight)
+        returns = pd.Series(ls_list, index=exp_ret.index, name="RefinedLS")
+        positions_df = pd.DataFrame(positions, index=returns.index)
+        turnover = self._compute_average_yearly_turnover(positions_df)
+        return returns, turnover
 
     # --------------------------------------------------------------------- #
     # Internal helper methods                                               #
@@ -693,7 +774,6 @@ class TechnicalTradingCase:
         ff5.iloc[:, :] /= 100.0
         mom /= 100.0
 
-
         # Build datetime index (YYYYMM → Timestamp at month end)
         to_dt = lambda x: pd.to_datetime(str(int(x)) + "01") + pd.offsets.MonthEnd(0)
         ff5.index = ff5.index.map(to_dt)
@@ -708,14 +788,9 @@ class TechnicalTradingCase:
 
         # Align on common dates
         ind = ind.loc[self.factors.index]
-        # Extract risk-free rates
-        rf = ff5.loc[ind.index, "RF"].values.reshape(-1, 1)
-        # Choose excess or absolute returns per user setting
-        if self.use_excess:
-            self.industries = ind.sub(rf, axis=0)
-        else:
-            self.industries = ind.copy()
-        # Store risk-free series
+        # Use raw returns for strategies; no subtraction of risk-free rate needed because long-short returns already net out the risk-free component
+        self.industries = ind.copy()
+        # Store risk-free series for reference
         self.rf = ff5.loc[ind.index, "RF"]
         # (industries_full already set above before aligning to factors)
 
@@ -801,6 +876,25 @@ class TechnicalTradingCase:
         return data
 
     # --------------------------------------------------------------------- #
+    def _compute_average_yearly_turnover(self, positions: pd.DataFrame) -> float:
+        """
+        Compute average annual turnover for a monthly strategy.
+
+        Parameters
+        ----------
+        positions :
+            DataFrame of portfolio weights for each asset (columns) and date (index).
+
+        Returns
+        -------
+        float
+            Average annual turnover percentage, computed as the mean monthly
+            turnover (half the sum of absolute weight changes) annualized
+            by 12 and expressed as a percent.
+        """
+        monthly_turnover = positions.diff().abs().sum(axis=1) * 0.5
+        avg_monthly = monthly_turnover.mean()
+        return avg_monthly * 12 * 100
     # Script entry point                                                    #
     # --------------------------------------------------------------------- #
     def run_all(self) -> None:  # pragma: no cover
@@ -831,21 +925,24 @@ class TechnicalTradingCase:
 
         print("\n=== 30-dummy regression strategy (in-sample) ===")
         res30 = self.multivariate_dummy_regression()
-        ls_ref = self.refined_strategy_returns()
+        ls_ref, turnover_ref = self.refined_strategy_returns()
         print(f"Adj-R² = {res30.rsquared_adj:.4f}")
         print(f"Sharpe = {annualised_sharpe_ratio(ls_ref):.2f}")
+        print(f"Turnover = {turnover_ref:.2f}%")
 
         # ---------- numeric-rank strategy ----------
         print("\n=== Numeric-rank strategy (in-sample) ===")
-        ls_rank, res_rank = self.numeric_rank_strategy()
+        ls_rank, res_rank, turnover_rank = self.numeric_rank_strategy()
         print(f"Adj-R² = {res_rank.rsquared_adj:.4f}")
         print(f"Sharpe = {annualised_sharpe_ratio(ls_rank):.2f}")
+        print(f"Turnover = {turnover_rank:.2f}%")
 
         # ---------- regression-tree strategy ----------
         print("\n=== Regression-tree strategy (in-sample) ===")
-        ls_tree, search_tree = self.regression_tree_strategy()
+        ls_tree, search_tree, turnover_tree = self.regression_tree_strategy()
         print(f"CV R² = {search_tree.best_score_:.4f}")
         print(f"Sharpe = {annualised_sharpe_ratio(ls_tree):.2f}")
+        print(f"Turnover = {turnover_tree:.2f}%")
 
         # ---------- FF regressions ----------
         # Optional decile monotonicity plots for all signals
@@ -854,13 +951,16 @@ class TechnicalTradingCase:
             plt.show()
         # ---------- OOS strategies (post-2000) ----------
         print("\n=== OOS Dummy strategy ===")
-        ls_do, r2_do = self.oos_dummy_strategy()
+        ls_do, r2_do, turnover_do = self.oos_dummy_strategy()
         print(f"OOS R² = {r2_do:.4f}, Sharpe = {annualised_sharpe_ratio(ls_do):.2f}")
+        print(f"Turnover = {turnover_do:.2f}%")
 
         print("\n=== OOS Numeric-rank strategy ===")
-        ls_ro, r2_ro = self.oos_numeric_rank_strategy()
+        ls_ro, r2_ro, turnover_ro = self.oos_numeric_rank_strategy()
         print(f"OOS R² = {r2_ro:.4f}, Sharpe = {annualised_sharpe_ratio(ls_ro):.2f}")
+        print(f"Turnover = {turnover_ro:.2f}%")
 
         print("\n=== OOS Regression-tree strategy ===")
-        ls_to, r2_to = self.oos_regression_tree_strategy()
+        ls_to, r2_to, turnover_to = self.oos_regression_tree_strategy()
         print(f"OOS R² = {r2_to:.4f}, Sharpe = {annualised_sharpe_ratio(ls_to):.2f}")
+        print(f"Turnover = {turnover_to:.2f}%")
